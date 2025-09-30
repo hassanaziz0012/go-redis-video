@@ -3,18 +3,24 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
 )
 
 type Config struct {
-	dir        string
-	rdb        []RDBSnapshot
-	rdbFn      string
-	aofEnabled bool
-	aofFn      string
-	aofFsync   FSyncMode
+	dir         string
+	rdb         []RDBSnapshot
+	rdbFn       string
+	aofEnabled  bool
+	aofFn       string
+	aofFsync    FSyncMode
+	requirepass bool
+	password    string
+	maxmem      int64
+	eviction    Eviction
+	memSamples  int
 }
 
 func NewConfig() *Config {
@@ -32,6 +38,19 @@ const (
 	Always   FSyncMode = "always"
 	EverySec FSyncMode = "everysec"
 	No       FSyncMode = "no"
+)
+
+type Eviction string
+
+const (
+	NoEviction     Eviction = "noeviction"
+	AllKeysRandom  Eviction = "allkeys-random"
+	AllKeysLRU     Eviction = "allkeys-lru"
+	AllKeysLFU     Eviction = "allkeys-lfu"
+	VolatileRandom Eviction = "volatile-random"
+	VolatileLRU    Eviction = "volatile-lru"
+	VolatileLFU    Eviction = "volatile-lfu"
+	VolatileTTL    Eviction = "volatile-ttl"
 )
 
 func readConf(fn string) *Config {
@@ -100,5 +119,53 @@ func parseLine(l string, conf *Config) {
 		} else {
 			conf.aofEnabled = false
 		}
+	case "requirepass":
+		conf.requirepass = true
+		conf.password = args[1]
+	case "maxmemory":
+		maxmem, err := parseMem(args[1])
+		if err != nil {
+			log.Println("cannot parse maxmemory. defaulting to 0. error: ", err)
+			conf.maxmem = 0
+			break
+		}
+		conf.maxmem = maxmem
+	case "maxmemory-policy":
+		conf.eviction = Eviction(args[1])
+	case "maxmemory-samples":
+		memSamples, err := strconv.Atoi(args[1])
+		if err != nil {
+			log.Println("cannot parse maxmemory-samples. defaulting to 50. error: ", err)
+			conf.memSamples = 50
+			break
+		}
+		conf.memSamples = memSamples
 	}
+}
+
+func parseMem(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+
+	var multiplier int64 = 1
+	switch {
+	case strings.HasSuffix(s, "kb"):
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "kb")
+	case strings.HasSuffix(s, "mb"):
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "mb")
+	case strings.HasSuffix(s, "gb"):
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "gb")
+	case strings.HasSuffix(s, "b"):
+		multiplier = 1
+		s = strings.TrimSuffix(s, "b")
+	}
+
+	num, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return num * multiplier, nil
 }

@@ -1,61 +1,87 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"maps"
-	"net"
 	"path/filepath"
+	"strconv"
+	"time"
 )
 
-type Handler func(*Value, *AppState) *Value
+type Handler func(*Client, *Value, *AppState) *Value
 
 var Handlers = map[string]Handler{
-	"COMMAND": command,
-	"GET":     get,
-	"SET":     set,
-	"DEL":     del,
-	"EXISTS":  exists,
-	"KEYS":    keys,
-	"SAVE":    save,
-	"BGSAVE":  bgsave,
-	"FLUSHDB": flushdb,
-	"DBSIZE":  dbsize,
+	"COMMAND":      command,
+	"GET":          get,
+	"SET":          set,
+	"DEL":          del,
+	"EXISTS":       exists,
+	"KEYS":         keys,
+	"SAVE":         save,
+	"BGSAVE":       bgsave,
+	"FLUSHDB":      flushdb,
+	"DBSIZE":       dbsize,
+	"AUTH":         auth,
+	"EXPIRE":       expire,
+	"TTL":          ttl,
+	"BGREWRITEAOF": bgrewriteaof,
+	"MULTI":        multi,
+	"EXEC":         _exec,
+	"DISCARD":      discard,
 }
 
-func handle(conn net.Conn, v *Value, state *AppState) {
+var SafeCMDs = []string{
+	"COMMAND",
+	"AUTH",
+}
+
+func handle(c *Client, v *Value, state *AppState) {
 	cmd := v.array[0].bulk
 	handler, ok := Handlers[cmd]
+	w := NewWriter(c.conn)
+
 	if !ok {
-		fmt.Println("invalid command: ", cmd)
+		w.Write(&Value{typ: ERROR, err: "ERR invalid command"})
+		w.Flush()
 		return
 	}
 
-	reply := handler(v, state)
-	w := NewWriter(conn)
+	if state.conf.requirepass && !c.authenticated && !contains(SafeCMDs, cmd) {
+		w.Write(&Value{typ: ERROR, err: "NOAUTH authentication required"})
+		w.Flush()
+		return
+	}
+
+	if state.tx != nil && cmd != "EXEC" && cmd != "DISCARD" {
+		txCmd := TxCommand{v: v, handler: handler}
+		state.tx.cmds = append(state.tx.cmds, &txCmd)
+		w.Write(&Value{typ: STRING, str: "QUEUED"})
+		w.Flush()
+		return
+	}
+
+	reply := handler(c, v, state)
 	w.Write(reply)
 	w.Flush()
 }
 
-func get(v *Value, state *AppState) *Value {
+func get(c *Client, v *Value, state *AppState) *Value {
 	args := v.array[1:]
 	if len(args) != 1 {
 		return &Value{typ: ERROR, err: "ERR invalid number of arguments for 'GET' command"}
 	}
 
 	name := args[0].bulk
-	DB.mu.RLock()
-	val, ok := DB.store[name]
-	DB.mu.RUnlock()
+	item, ok := DB.Get(name)
 
 	if !ok {
 		return &Value{typ: NULL}
 	}
 
-	return &Value{typ: BULK, bulk: val}
+	return &Value{typ: BULK, bulk: item.V}
 }
 
-func set(v *Value, state *AppState) *Value {
+func set(c *Client, v *Value, state *AppState) *Value {
 	args := v.array[1:]
 	if len(args) != 2 {
 		return &Value{typ: ERROR, err: "ERR invalid number of arguments for 'SET' command"}
@@ -64,7 +90,11 @@ func set(v *Value, state *AppState) *Value {
 	key := args[0].bulk
 	val := args[1].bulk
 	DB.mu.Lock()
-	DB.store[key] = val
+	err := DB.Set(key, val, state)
+	if err != nil {
+		DB.mu.Unlock()
+		return &Value{typ: ERROR, err: "ERR " + err.Error()}
+	}
 
 	if state.conf.aofEnabled {
 		log.Println("saving AOF record")
@@ -83,14 +113,14 @@ func set(v *Value, state *AppState) *Value {
 	return &Value{typ: STRING, str: "OK"}
 }
 
-func del(v *Value, state *AppState) *Value {
+func del(c *Client, v *Value, state *AppState) *Value {
 	args := v.array[1:]
 	var n int
 
 	DB.mu.Lock()
 	for _, arg := range args {
 		_, ok := DB.store[arg.bulk]
-		delete(DB.store, arg.bulk)
+		DB.Delete(arg.bulk)
 		if ok {
 			n++
 		}
@@ -100,7 +130,7 @@ func del(v *Value, state *AppState) *Value {
 	return &Value{typ: INTEGER, num: n}
 }
 
-func exists(v *Value, state *AppState) *Value {
+func exists(c *Client, v *Value, state *AppState) *Value {
 	args := v.array[1:]
 	var n int
 
@@ -116,7 +146,7 @@ func exists(v *Value, state *AppState) *Value {
 	return &Value{typ: INTEGER, num: n}
 }
 
-func keys(v *Value, state *AppState) *Value {
+func keys(c *Client, v *Value, state *AppState) *Value {
 	args := v.array[1:]
 	if len(args) > 1 {
 		return &Value{typ: ERROR, err: "ERR invalid number of arguments for 'KEYS' command"}
@@ -146,23 +176,23 @@ func keys(v *Value, state *AppState) *Value {
 	return &reply
 }
 
-func save(v *Value, state *AppState) *Value {
+func save(c *Client, v *Value, state *AppState) *Value {
 	SaveRDB(state)
 	return &Value{typ: STRING, str: "OK"}
 }
 
-func bgsave(v *Value, state *AppState) *Value {
+func bgsave(c *Client, v *Value, state *AppState) *Value {
 	if state.bgsaveRunning {
 		return &Value{typ: ERROR, err: "ERR background saving already in progress"}
 	}
 
-	c := make(map[string]string, len(DB.store))
+	cp := make(map[string]*Item, len(DB.store))
 	DB.mu.RLock()
-	maps.Copy(c, DB.store)
+	maps.Copy(cp, DB.store)
 	DB.mu.RUnlock()
 
 	state.bgsaveRunning = true
-	state.dbCopy = c
+	state.dbCopy = cp
 
 	go func() {
 		defer func() {
@@ -176,15 +206,15 @@ func bgsave(v *Value, state *AppState) *Value {
 	return &Value{typ: STRING, str: "OK"}
 }
 
-func flushdb(v *Value, state *AppState) *Value {
+func flushdb(c *Client, v *Value, state *AppState) *Value {
 	DB.mu.Lock()
-	DB.store = map[string]string{}
+	DB.store = map[string]*Item{}
 	DB.mu.Unlock()
 
 	return &Value{typ: STRING, str: "OK"}
 }
 
-func dbsize(v *Value, state *AppState) *Value {
+func dbsize(c *Client, v *Value, state *AppState) *Value {
 	DB.mu.RLock()
 	size := len(DB.store)
 	DB.mu.RUnlock()
@@ -192,6 +222,128 @@ func dbsize(v *Value, state *AppState) *Value {
 	return &Value{typ: INTEGER, num: size}
 }
 
-func command(v *Value, state *AppState) *Value {
+func auth(c *Client, v *Value, state *AppState) *Value {
+	args := v.array[1:]
+	if len(args) != 1 {
+		return &Value{typ: ERROR, err: "ERR invalid number of arguments for 'AUTH' command"}
+	}
+
+	p := args[0].bulk
+	if state.conf.password == p {
+		c.authenticated = true
+		return &Value{typ: STRING, str: "OK"}
+	} else {
+		c.authenticated = false
+		return &Value{typ: ERROR, err: "ERR invalid password"}
+	}
+}
+
+func expire(c *Client, v *Value, state *AppState) *Value {
+	args := v.array[1:]
+	if len(args) != 2 {
+		return &Value{typ: ERROR, err: "ERR invalid number of arguments for 'EXPIRE' command"}
+	}
+
+	k := args[0].bulk
+	exp := args[1].bulk
+
+	expSecs, err := strconv.Atoi(exp)
+	if err != nil {
+		return &Value{typ: ERROR, err: "ERR invalid expiry value"}
+	}
+
+	DB.mu.RLock()
+	key, ok := DB.store[k]
+	if !ok {
+		return &Value{typ: INTEGER, num: 0}
+	}
+	key.Exp = time.Now().Add(time.Second * time.Duration(expSecs))
+	DB.mu.RUnlock()
+
+	return &Value{typ: INTEGER, num: 1}
+}
+
+func ttl(c *Client, v *Value, state *AppState) *Value {
+	args := v.array[1:]
+	if len(args) != 1 {
+		return &Value{typ: ERROR, err: "ERR invalid number of arguments for 'TTL' command"}
+	}
+
+	k := args[0].bulk
+
+	DB.mu.RLock()
+	key, ok := DB.store[k]
+	if !ok {
+		return &Value{typ: INTEGER, num: -2}
+	}
+	exp := key.Exp
+	DB.mu.RUnlock()
+
+	if exp.Unix() == UNIX_TS_EPOCH {
+		return &Value{typ: INTEGER, num: -1}
+	}
+
+	expSecs := int(time.Until(exp).Seconds())
+	if expSecs <= 0 {
+		DB.mu.Lock()
+		DB.Delete(k)
+		DB.mu.Unlock()
+		return &Value{typ: INTEGER, num: -2}
+	}
+
+	return &Value{typ: INTEGER, num: expSecs}
+}
+
+func bgrewriteaof(c *Client, v *Value, state *AppState) *Value {
+	go func() {
+		DB.mu.RLock()
+		cp := make(map[string]*Item, len(DB.store))
+		maps.Copy(cp, DB.store)
+		DB.mu.RUnlock()
+
+		state.aof.Rewrite(cp)
+	}()
+
+	return &Value{typ: STRING, str: "Background AOF rewriting started"}
+}
+
+func multi(c *Client, v *Value, state *AppState) *Value {
+	if state.tx != nil {
+		return &Value{typ: ERROR, err: "ERR MULTI calls can not be nested"}
+	}
+
+	state.tx = NewTransaction()
+
+	return &Value{typ: STRING, str: "OK"}
+}
+
+func _exec(c *Client, v *Value, state *AppState) *Value {
+	if state.tx == nil {
+		return &Value{typ: ERROR, err: "ERR EXEC without MULTI"}
+	}
+
+	replies := make([]Value, len(state.tx.cmds))
+	for i, cmd := range state.tx.cmds {
+		reply := cmd.handler(c, cmd.v, state)
+		replies[i] = *reply
+	}
+
+	reply := Value{typ: ARRAY, array: replies}
+
+	state.tx = nil
+
+	return &reply
+}
+
+func discard(c *Client, v *Value, state *AppState) *Value {
+	if state.tx == nil {
+		return &Value{typ: ERROR, err: "ERR DISCARD without MULTI"}
+	}
+
+	state.tx = nil
+	return &Value{typ: STRING, str: "OK"}
+}
+
+func command(c *Client, v *Value, state *AppState) *Value {
 	return &Value{typ: STRING, str: "OK"}
 }

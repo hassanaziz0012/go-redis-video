@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -30,9 +32,10 @@ func NewAof(conf *Config) *Aof {
 }
 
 func (aof *Aof) Sync() {
+	r := bufio.NewReader(aof.f)
 	for {
 		v := Value{}
-		err := v.readArray(aof.f)
+		err := v.readArray(r)
 		if err == io.EOF {
 			break
 		}
@@ -42,6 +45,40 @@ func (aof *Aof) Sync() {
 		}
 
 		blankState := NewAppState(&Config{})
-		set(&v, blankState)
+		blankClient := Client{}
+		set(&blankClient, &v, blankState)
 	}
+}
+
+func (aof *Aof) Rewrite(cp map[string]*Item) {
+	// reroute future AOF records to buffer
+	var b bytes.Buffer
+	aof.w = NewWriter(&b)
+
+	// clear file contents
+	if err := aof.f.Truncate(0); err != nil {
+		log.Println("aof rewrite - truncate error: ", err)
+		return
+	}
+	if _, err := aof.f.Seek(0, 0); err != nil {
+		log.Println("aof rewrite - seek error: ", err)
+		return
+	}
+
+	// write all SET commands to file
+	fwriter := NewWriter(aof.f)
+	for k, v := range cp {
+		cmd := Value{typ: BULK, bulk: "SET"}
+		key := Value{typ: BULK, bulk: k}
+		val := Value{typ: BULK, bulk: v.V}
+
+		arr := Value{typ: ARRAY, array: []Value{
+			cmd, key, val,
+		}}
+		fwriter.Write(&arr)
+	}
+	fwriter.Flush()
+
+	// reroute future AOF records back to file
+	aof.w = NewWriter(aof.f)
 }

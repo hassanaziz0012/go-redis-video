@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"net"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"time"
 )
+
+var UNIX_TS_EPOCH int64 = -62135596800
 
 func main() {
 	log.Println("reading config file")
@@ -52,22 +55,34 @@ func main() {
 
 func handleConn(conn net.Conn, state *AppState) {
 	log.Println("accepted new connection: ", conn.LocalAddr().String())
+	c := NewClient(conn)
+	r := bufio.NewReader(conn)
 	for {
 		v := Value{typ: ARRAY}
-		if err := v.readArray(conn); err != nil {
+		if err := v.readArray(r); err != nil {
 			log.Println(err)
 			break
 		}
-		handle(conn, &v, state)
+		handle(c, &v, state)
 	}
 	log.Println("connection closed: ", conn.LocalAddr().String())
+}
+
+type Client struct {
+	conn          net.Conn
+	authenticated bool
+}
+
+func NewClient(conn net.Conn) *Client {
+	return &Client{conn: conn}
 }
 
 type AppState struct {
 	conf          *Config
 	aof           *Aof
 	bgsaveRunning bool
-	dbCopy        map[string]string
+	dbCopy        map[string]*Item
+	tx            *Transaction
 }
 
 func NewAppState(conf *Config) *AppState {

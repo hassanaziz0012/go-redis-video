@@ -1,9 +1,12 @@
 package main
 
 import (
-	"fmt"
+	"bufio"
+	"errors"
 	"io"
+	"log"
 	"strconv"
+	"strings"
 )
 
 type ValueType string
@@ -26,39 +29,57 @@ type Value struct {
 	array []Value
 }
 
-func (v *Value) readArray(reader io.Reader) error {
-	buf := make([]byte, 4)
-	_, err := reader.Read(buf)
+func readLine(r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(line, "\r\n"), nil
+}
+
+func (v *Value) readArray(r *bufio.Reader) error {
+	line, err := readLine(r)
 	if err != nil {
 		return err
 	}
 
-	arrLen, err := strconv.Atoi(string(buf[1]))
+	if line[0] != '*' {
+		return errors.New("expected array")
+	}
+
+	arrLen, err := strconv.Atoi(line[1:])
 	if err != nil {
 		return err
 	}
 
 	for range arrLen {
-		bulk := v.readBulk(reader)
+		bulk, err := v.readBulk(r)
+		if err != nil {
+			log.Println(err)
+			break
+		}
 		v.array = append(v.array, bulk)
 	}
 
 	return nil
 }
 
-func (v *Value) readBulk(reader io.Reader) Value {
-	buf := make([]byte, 4)
-	reader.Read(buf)
-
-	n, err := strconv.Atoi(string(buf[1]))
+func (v *Value) readBulk(r *bufio.Reader) (Value, error) {
+	line, err := readLine(r)
 	if err != nil {
-		fmt.Println(err)
-		return Value{}
+		return Value{}, err
 	}
 
-	bulkBuf := make([]byte, n+2)
-	reader.Read(bulkBuf)
+	n, err := strconv.Atoi(line[1:])
+	if err != nil {
+		return Value{}, err
+	}
 
-	bulk := string(bulkBuf[:n])
-	return Value{typ: BULK, bulk: bulk}
+	buf := make([]byte, n+2)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return Value{}, err
+	}
+
+	bulk := string(buf[:n])
+	return Value{typ: BULK, bulk: bulk}, nil
 }

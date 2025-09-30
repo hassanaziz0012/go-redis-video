@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/gob"
 	"encoding/hex"
@@ -62,16 +63,50 @@ func SaveRDB(state *AppState) {
 	defer f.Close()
 
 	log.Println("saving DB to RDB file")
+	var buf bytes.Buffer
 	if state.bgsaveRunning {
-		err = gob.NewEncoder(f).Encode(&state.dbCopy)
+		err = gob.NewEncoder(&buf).Encode(&state.dbCopy)
 	} else {
 		DB.mu.RLock()
-		err = gob.NewEncoder(f).Encode(&DB.store)
+		err = gob.NewEncoder(&buf).Encode(&DB.store)
 		DB.mu.RUnlock()
 	}
 
 	if err != nil {
-		log.Println("error saving rdb file: ", err)
+		log.Println("error encoding db: ", err)
+		return
+	}
+
+	data := buf.Bytes()
+
+	bsum, err := Hash(&buf)
+	if err != nil {
+		log.Println("rdb - cannot compute buf checksum: ", err)
+		return
+	}
+
+	_, err = f.Write(data)
+	if err != nil {
+		log.Println("rdb - cannot write to file: ", err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		log.Println("rdb - cannot flush file to disk: ", err)
+		return
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		log.Println("rdb - cannot seek file: ", err)
+		return
+	}
+
+	fsum, err := Hash(f)
+	if err != nil {
+		log.Println("rdb - cannot compute file checksum: ", err)
+		return
+	}
+
+	if bsum != fsum {
+		log.Printf("rdb - buf and file checksums do not match:\nf=%s\nb=%s\n", fsum, bsum)
 		return
 	}
 
