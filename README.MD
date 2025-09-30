@@ -18,6 +18,9 @@ COMMAND, GET, SET, DEL, EXISTS, KEYS, SAVE, BGSAVE, FLUSHDB, DBSIZE, AUTH, EXPIR
 - Concurrency-safe (this is less a flex and more a standard in Go, tbh)
 - All features configurable with a simple Redis-compatible config file.
 
+## How to use?
+Just clone this repo, compile it in Go, and run it. Then you can use any redis client to connect to the server running on :5432. Have fun! ✌
+
 ## What can you do with this?
 Whatever you want to, tbh. Like I said, I mainly just built this for learning purposes, and to just make some content for my YT channel. 
 
