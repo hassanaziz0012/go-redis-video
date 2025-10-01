@@ -111,6 +111,9 @@ func SaveRDB(state *AppState) {
 	}
 
 	log.Println("saved RDB file")
+
+	state.rdbStats.rdb_last_save_ts = time.Now().Unix()
+	state.rdbStats.rdb_saves++
 }
 
 func SyncRDB(conf *Config) {

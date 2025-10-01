@@ -6,8 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"sync"
-	"time"
 )
 
 var UNIX_TS_EPOCH int64 = -62135596800
@@ -20,7 +18,7 @@ func main() {
 
 	if conf.aofEnabled {
 		log.Println("syncing AOF records")
-		state.aof.Sync()
+		state.aof.Sync(conf.maxmem, conf.eviction, conf.memSamples)
 	}
 
 	if len(conf.rdb) > 0 {
@@ -35,7 +33,6 @@ func main() {
 	defer l.Close()
 	log.Println("listening on :6379")
 
-	var wg sync.WaitGroup
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -44,19 +41,33 @@ func main() {
 		}
 		log.Println("connection accepted")
 
-		wg.Add(1)
 		go func() {
 			handleConn(conn, state)
-			wg.Done()
 		}()
 	}
-	wg.Wait()
 }
 
 func handleConn(conn net.Conn, state *AppState) {
 	log.Println("accepted new connection: ", conn.LocalAddr().String())
 	c := NewClient(conn)
 	r := bufio.NewReader(conn)
+
+	defer func() {
+		new := state.monitors[:0]
+		for _, mon := range state.monitors {
+			if mon != c {
+				new = append(new, mon)
+			}
+		}
+		state.monitors = new
+	}()
+
+	state.clientCount++
+	defer func() {
+		state.clientCount--
+	}()
+	state.generalStats.total_connections_received++
+
 	for {
 		v := Value{typ: ARRAY}
 		if err := v.readArray(r); err != nil {
@@ -66,44 +77,4 @@ func handleConn(conn net.Conn, state *AppState) {
 		handle(c, &v, state)
 	}
 	log.Println("connection closed: ", conn.LocalAddr().String())
-}
-
-type Client struct {
-	conn          net.Conn
-	authenticated bool
-}
-
-func NewClient(conn net.Conn) *Client {
-	return &Client{conn: conn}
-}
-
-type AppState struct {
-	conf          *Config
-	aof           *Aof
-	bgsaveRunning bool
-	dbCopy        map[string]*Item
-	tx            *Transaction
-}
-
-func NewAppState(conf *Config) *AppState {
-	state := AppState{
-		conf: conf,
-	}
-
-	if conf.aofEnabled {
-		state.aof = NewAof(conf)
-
-		if conf.aofFsync == EverySec {
-			go func() {
-				t := time.NewTicker(time.Second)
-				defer t.Stop()
-
-				for range t.C {
-					state.aof.w.Flush()
-				}
-			}()
-		}
-	}
-
-	return &state
 }

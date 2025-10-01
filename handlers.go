@@ -28,6 +28,8 @@ var Handlers = map[string]Handler{
 	"MULTI":        multi,
 	"EXEC":         _exec,
 	"DISCARD":      discard,
+	"MONITOR":      monitor,
+	"INFO":         info,
 }
 
 var SafeCMDs = []string{
@@ -63,6 +65,16 @@ func handle(c *Client, v *Value, state *AppState) {
 	reply := handler(c, v, state)
 	w.Write(reply)
 	w.Flush()
+
+	state.generalStats.total_commands_processed++
+
+	go func() {
+		for _, mon := range state.monitors {
+			if mon != c {
+				mon.writeMonitorLog(v)
+			}
+		}
+	}()
 }
 
 func get(c *Client, v *Value, state *AppState) *Value {
@@ -72,7 +84,7 @@ func get(c *Client, v *Value, state *AppState) *Value {
 	}
 
 	name := args[0].bulk
-	item, ok := DB.Get(name)
+	item, ok := DB.Get(name, state)
 
 	if !ok {
 		return &Value{typ: NULL}
@@ -272,36 +284,41 @@ func ttl(c *Client, v *Value, state *AppState) *Value {
 	k := args[0].bulk
 
 	DB.mu.RLock()
-	key, ok := DB.store[k]
+	item, ok := DB.store[k]
 	if !ok {
 		return &Value{typ: INTEGER, num: -2}
 	}
-	exp := key.Exp
+	exp := item.Exp
 	DB.mu.RUnlock()
 
 	if exp.Unix() == UNIX_TS_EPOCH {
 		return &Value{typ: INTEGER, num: -1}
 	}
 
-	expSecs := int(time.Until(exp).Seconds())
-	if expSecs <= 0 {
-		DB.mu.Lock()
-		DB.Delete(k)
-		DB.mu.Unlock()
+	expired := DB.tryExpire(k, item, state)
+	if expired {
 		return &Value{typ: INTEGER, num: -2}
 	}
 
+	expSecs := int(time.Until(exp).Seconds())
 	return &Value{typ: INTEGER, num: expSecs}
 }
 
 func bgrewriteaof(c *Client, v *Value, state *AppState) *Value {
 	go func() {
+		state.aofRewriteRunning = true
+		defer func() {
+			state.aofRewriteRunning = false
+		}()
+
 		DB.mu.RLock()
 		cp := make(map[string]*Item, len(DB.store))
 		maps.Copy(cp, DB.store)
 		DB.mu.RUnlock()
 
 		state.aof.Rewrite(cp)
+
+		state.aofStats.aof_rewrites++
 	}()
 
 	return &Value{typ: STRING, str: "Background AOF rewriting started"}
@@ -346,4 +363,14 @@ func discard(c *Client, v *Value, state *AppState) *Value {
 
 func command(c *Client, v *Value, state *AppState) *Value {
 	return &Value{typ: STRING, str: "OK"}
+}
+
+func monitor(c *Client, v *Value, state *AppState) *Value {
+	state.monitors = append(state.monitors, c)
+	return &Value{typ: STRING, str: "OK"}
+}
+
+func info(c *Client, v *Value, state *AppState) *Value {
+	msg := state.info.print(state)
+	return &Value{typ: BULK, bulk: msg}
 }

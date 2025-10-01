@@ -31,7 +31,7 @@ func NewAof(conf *Config) *Aof {
 	return &aof
 }
 
-func (aof *Aof) Sync() {
+func (aof *Aof) Sync(maxmem int64, evictionpolicy Eviction, memsamples int) {
 	r := bufio.NewReader(aof.f)
 	for {
 		v := Value{}
@@ -44,7 +44,11 @@ func (aof *Aof) Sync() {
 			break
 		}
 
-		blankState := NewAppState(&Config{})
+		blankState := NewAppState(&Config{
+			maxmem:     maxmem,
+			eviction:   evictionpolicy,
+			memSamples: memsamples,
+		})
 		blankClient := Client{}
 		set(&blankClient, &v, blankState)
 	}
